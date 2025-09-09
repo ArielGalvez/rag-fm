@@ -1,99 +1,93 @@
-// src/index.ts
-import { Pool } from 'pg';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { Client } from 'pg';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-// 1️⃣ Conexión a PostgreSQL
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+const pgClient = new Client({ connectionString: process.env.DATABASE_URL });
 
-// 2️⃣ Inicializar cliente de Gemini
-const gemini = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-});
-
-// 3️⃣ Función para generar embeddings usando Gemini
-async function getEmbedding(text: string) {
-  const resp = await gemini.embeddings.create({
-    model: 'embed-gecko-001',
-    input: text,
-  });
-  return resp.data[0].embedding;
+export async function getEmbedding(text: string) {
+  const model = genAI.getGenerativeModel({ model: 'embedding-001' });
+  const embedding = await model.embedContent(text);
+  return embedding.embedding.values;
 }
 
-// 4️⃣ Indexar documentos en PostgreSQL
-async function addDocuments(docs: string[]) {
-  for (const text of docs) {
-    try {
-      const embedding = await getEmbedding(text);
-      await pool.query(
-        `INSERT INTO documents (content, embedding) VALUES ($1, $2)`,
-        [text, embedding]
-      );
-    } catch (err: any) {
-      console.error('Error al generar embedding:', err);
-    }
-  }
-}
+// Función para insertar documentos de prueba
+async function seedDocuments() {
+  // await pgClient.connect();
 
-// 5️⃣ Buscar documentos similares
-async function searchSimilar(query: string, k = 3) {
-  try {
-    const embedding = await getEmbedding(query);
-    const { rows } = await pool.query(
-      `SELECT content, embedding <#> $1::vector AS distance
-       FROM documents
-       ORDER BY distance ASC
-       LIMIT $2`,
-      [embedding, k]
-    );
-    return rows.map((r) => r.content);
-  } catch (err: any) {
-    console.error('Error al buscar embeddings:', err);
-    return [];
-  }
-}
-
-// 6️⃣ Responder preguntas con contexto (RAG)
-async function askQuestion(question: string) {
-  const contextDocs = await searchSimilar(question, 3);
-  if (contextDocs.length === 0) {
-    console.log('⚠️ No hay contexto disponible.');
+  const existing = await pgClient.query('SELECT COUNT(*) FROM documents');
+  if (parseInt(existing.rows[0].count) > 0) {
+    console.log('Ya existen documentos. Saltando seed...');
     return;
   }
 
-  const context = contextDocs.join('\n');
-  const prompt = `
-Usa la siguiente información para responder la pregunta:
+  console.log('Insertando documentos de prueba...');
 
-${context}
+  const docs = [
+    {
+      content: 'El Dr. Pérez atiende de lunes a viernes de 9:00 a 12:00 y de 15:00 a 18:00.',
+    },
+    {
+      content: 'El Dr. López atiende únicamente los sábados de 10:00 a 13:00.',
+    },
+    {
+      content: 'Las citas deben reservarse con al menos 24 horas de anticipación.',
+    },
+  ];
 
-Pregunta: ${question}
-Respuesta:
-`;
+  for (const doc of docs) {
+    const embedding = await getEmbedding(doc.content);
 
-  try {
-    const response = await gemini.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-    });
+    // Convertir a formato pgvector "[x,y,z]"
+    const vectorParam = `[${embedding.join(',')}]`;
 
-    console.log('✅ Respuesta:', response.text);
-  } catch (err: any) {
-    console.error('Error al generar la respuesta:', err);
+    await pgClient.query(
+      'INSERT INTO documents (content, embedding) VALUES ($1, $2)',
+      [doc.content, vectorParam]
+    );
   }
+
+  console.log('Documentos de prueba insertados ✅');
 }
 
-// 7️⃣ Ejemplo de uso
-(async () => {
-  await addDocuments([
-    'La capital de Bolivia es Sucre, pero la sede de gobierno está en La Paz.',
-    'El lago Titicaca es el lago navegable más alto del mundo.',
-    'El salar de Uyuni es el desierto de sal más grande del planeta.',
-  ]);
+async function runRAG(query: string) {
+  // await pgClient.connect();
 
-  await askQuestion('¿Dónde está el salar más grande del mundo?');
-})();
+  // 1. Crear embedding con Gemini
+  const queryEmbedding = await getEmbedding(query);
+
+  // 🔥 Convertir array a formato pgvector "[x,y,z]"
+  const vectorParam = `[${queryEmbedding.join(',')}]`;
+
+  // 2. Buscar documentos similares en PostgreSQL (pgvector)
+  const searchQuery = `
+    SELECT content
+    FROM documents
+    ORDER BY embedding <-> $1
+    LIMIT 3;
+  `;
+  const result = await pgClient.query(searchQuery, [vectorParam]);
+  const context = result.rows.map((r) => r.content).join('\n');
+
+  // 3. Generar respuesta con Gemini (sin role/parts)
+  const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+  const completion = await model.generateContent(
+    `Pregunta: ${query}\n\nContexto:\n${context}`
+  );
+
+  console.log('Respuesta:', completion.response.text());
+
+  // await pgClient.end();
+}
+
+// 🔥 Ejecutar
+async function main() {
+  await pgClient.connect(); // Conectar solo una vez
+  await seedDocuments();
+  await runRAG('¿Cuál es el horario del Dr. Pérez?');
+  await pgClient.end(); // Cerrar al final
+}
+
+main().catch(console.error);
